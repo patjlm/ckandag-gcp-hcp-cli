@@ -23,4 +23,4 @@ terraform-apply:
 	cd deploy && terraform init -upgrade && \
 		terraform apply -var="project_id=$(PROJECT_ID)" -var="region=$(REGION)"
 
-all: terraform-apply deploy
+all: build push terraform-apply refresh

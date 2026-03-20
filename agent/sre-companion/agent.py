@@ -24,6 +24,7 @@ logger = logging.getLogger("sre-companion.agent")
 
 MAX_REMOTE_TOOL_ITERATIONS = 15
 MAX_INPUT_TOKENS = 1_000_000  # leave headroom below the 1,048,576 hard limit
+MAX_CONSECUTIVE_STALLS = 3  # text-only responses or invalid tool calls before breaking
 
 
 def run_agent(history, client_tools, tool_result=None,
@@ -109,9 +110,9 @@ def run_agent(history, client_tools, tool_result=None,
     # Iterative tool-calling loop
     limit = max_iterations if max_iterations and max_iterations > 0 else MAX_REMOTE_TOOL_ITERATIONS
     iteration = 0
-    while iteration < limit:
-        iteration += 1
+    stall_count = 0  # consecutive turns without a successful remote tool invocation
 
+    while iteration < limit:
         function_calls = _extract_function_calls(response)
         text = _extract_text(response)
 
@@ -139,6 +140,7 @@ def run_agent(history, client_tools, tool_result=None,
 
         # All calls are remote — execute them and collect responses
         response_parts = []
+        any_valid = False
         for fc in function_calls:
             tool_name = fc.name
             tool_args = dict(fc.args) if fc.args else {}
@@ -148,6 +150,7 @@ def run_agent(history, client_tools, tool_result=None,
                 result = {"error": f"Unknown remote tool: {tool_name}"}
             else:
                 result = workflow_tool_client.invoke(workflow_name, tool_args)
+                any_valid = True
 
             yield {
                 "event": "tool_result",
@@ -158,6 +161,16 @@ def run_agent(history, client_tools, tool_result=None,
             response_parts.append(
                 Part.from_function_response(name=tool_name, response=result)
             )
+
+        # Only consume iteration budget on successful tool invocations
+        if any_valid:
+            iteration += 1
+            stall_count = 0
+        else:
+            stall_count += 1
+            if stall_count >= MAX_CONSECUTIVE_STALLS:
+                logger.warning("Breaking after %d consecutive stalls (no valid tools)", stall_count)
+                break
 
         try:
             response = chat.send_message(Content(parts=response_parts))
@@ -224,11 +237,20 @@ def _extract_function_calls(response):
 
 
 def _extract_text(response):
-    """Extract text content from a Gemini response."""
+    """Extract text content from a Gemini response.
+
+    Parts may contain function_call, thought_signature, or other non-text
+    fields. We safely skip any part that doesn't have a text attribute.
+    """
     if not response.candidates:
         return ""
-    parts = response.candidates[0].content.parts
-    texts = [part.text for part in parts if part.text]
+    texts = []
+    for part in response.candidates[0].content.parts:
+        try:
+            if part.text:
+                texts.append(part.text)
+        except (AttributeError, ValueError):
+            continue
     return "\n".join(texts)
 
 

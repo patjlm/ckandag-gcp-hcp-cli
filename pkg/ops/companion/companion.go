@@ -32,6 +32,7 @@ func NewCompanionCmd() *cobra.Command {
 	var (
 		serviceName string
 		timeout     time.Duration
+		pdIncident  string
 	)
 
 	cmd := &cobra.Command{
@@ -66,17 +67,18 @@ Examples:
 			ctx, cancel := context.WithTimeout(cmd.Context(), timeout)
 			defer cancel()
 
-			return runCompanion(ctx, project, region, serviceName, os.Stdout, os.Stderr)
+			return runCompanion(ctx, project, region, serviceName, pdIncident, os.Stdout, os.Stderr)
 		},
 	}
 
 	cmd.Flags().StringVar(&serviceName, "service-name", "sre-companion-agent", "Cloud Run service name")
 	cmd.Flags().DurationVar(&timeout, "timeout", 10*time.Minute, "Maximum session duration")
+	cmd.Flags().StringVar(&pdIncident, "pagerduty-incident", "", "Pre-load a PagerDuty incident for context")
 
 	return cmd
 }
 
-func runCompanion(ctx context.Context, project, region, serviceName string, stdout, stderr io.Writer) error {
+func runCompanion(ctx context.Context, project, region, serviceName, pdIncident string, stdout, stderr io.Writer) error {
 	client := cloudrun.NewClient(ctx, project, region)
 
 	// Discover service URL
@@ -115,6 +117,9 @@ func runCompanion(ctx context.Context, project, region, serviceName string, stdo
 
 	fmt.Fprintf(stderr, "\n%sSRE Companion ready.%s Type your message, %s/resume%s to resume a session, or %sexit%s to quit.\n", bold, reset, italic, reset, italic, reset)
 
+	// Pre-load PagerDuty incident if requested (needs rl and executor initialized first)
+	pendingPDIncident := pdIncident
+
 	// Set up readline with history and colored prompt
 	prompt := fmt.Sprintf("\n%s───────────────────────────────────────────%s\n%s%s> %s", dim, reset, bold, project, reset)
 
@@ -131,13 +136,21 @@ func runCompanion(ctx context.Context, project, region, serviceName string, stdo
 	executor := &ToolExecutor{Project: project, Region: region}
 
 	for {
-		input, err := rl.ReadLine()
-		if err != nil {
-			break // EOF or interrupt
-		}
-		input = strings.TrimSpace(input)
-		if input == "" {
-			continue
+		// Handle pre-loaded PagerDuty incident on first iteration
+		var input string
+		if pendingPDIncident != "" {
+			input = "/pd " + pendingPDIncident
+			pendingPDIncident = ""
+		} else {
+			var err error
+			input, err = rl.ReadLine()
+			if err != nil {
+				break // EOF or interrupt
+			}
+			input = strings.TrimSpace(input)
+			if input == "" {
+				continue
+			}
 		}
 		if input == "exit" || input == "/quit" {
 			break
@@ -147,6 +160,7 @@ func runCompanion(ctx context.Context, project, region, serviceName string, stdo
 			fmt.Fprintf(stderr, "\n%sCommands:%s\n", bold, reset)
 			fmt.Fprintf(stderr, "  %s/help%s              Show this help\n", green, reset)
 			fmt.Fprintf(stderr, "  %s/resume%s            Resume a previous session\n", green, reset)
+			fmt.Fprintf(stderr, "  %s/pd <incident-id>%s  Load a PagerDuty incident for context\n", green, reset)
 			fmt.Fprintf(stderr, "  %s/max-iterations N%s  Set max remote tool iterations per turn (current: %d)\n", green, reset, maxIterations)
 			fmt.Fprintf(stderr, "  %s/quit%s, %sexit%s       Exit the session\n", green, reset, green, reset)
 			fmt.Fprintf(stderr, "\n%sAnything else is sent to the SRE companion agent.%s\n", dim, reset)
@@ -174,6 +188,34 @@ func runCompanion(ctx context.Context, project, region, serviceName string, stdo
 			} else if resumed != nil {
 				history = resumed
 				printHistory(history, stdout)
+			}
+			continue
+		}
+
+		if strings.HasPrefix(input, "/pd") {
+			parts := strings.Fields(input)
+			if len(parts) != 2 {
+				fmt.Fprintf(stderr, "%sUsage: /pd <incident-id>%s\n", yellow, reset)
+			} else {
+				pdCtx, err := loadPDIncident(ctx, parts[1], stderr)
+				if err != nil {
+					fmt.Fprintf(stderr, "%sError: %v%s\n", red, err, reset)
+				} else {
+					msg := "I'm investigating this PagerDuty incident. Help me diagnose and remediate it.\n\n" + pdCtx.Summary
+					history = append(history, cloudrun.ChatMessage{Role: "user", Content: msg})
+					sessionLog.Log(SessionEvent{Type: "user", Content: "PagerDuty incident " + pdCtx.IncidentID + " loaded"})
+					fmt.Fprintf(stderr, "%sLoaded PagerDuty incident %s — sending to agent...%s\n", green, pdCtx.IncidentID, reset)
+
+					assistantText, err := chatTurn(ctx, client, serviceURL, history, tools, maxIterations, executor, sessionLog, rl, stdout, stderr)
+					if err != nil {
+						fmt.Fprintf(stderr, "%sError: %v%s\n", red, err, reset)
+						history = history[:len(history)-1]
+					} else if assistantText != "" {
+						history = append(history, cloudrun.ChatMessage{Role: "assistant", Content: assistantText})
+						sessionLog.Log(SessionEvent{Type: "assistant", Content: assistantText})
+					}
+					fmt.Fprintln(stdout)
+				}
 			}
 			continue
 		}
@@ -333,6 +375,15 @@ func printHistory(history []cloudrun.ChatMessage, w io.Writer) {
 		fmt.Fprintln(w)
 	}
 	fmt.Fprintf(w, "%s── End of history ──%s\n", dim, reset)
+}
+
+func loadPDIncident(ctx context.Context, incidentID string, stderr io.Writer) (*PDIncidentContext, error) {
+	fmt.Fprintf(stderr, "%sFetching PagerDuty incident %s...%s\n", dim, incidentID, reset)
+	pdClient, err := NewPDClient()
+	if err != nil {
+		return nil, err
+	}
+	return pdClient.FetchIncidentContext(ctx, incidentID)
 }
 
 func handleResume(project string, rl *readline.Instance, stderr io.Writer) ([]cloudrun.ChatMessage, error) {
