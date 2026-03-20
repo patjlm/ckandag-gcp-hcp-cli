@@ -12,9 +12,9 @@ import (
 )
 
 // EnsurePAMGrant checks if a workflow requires PAM and ensures the user has an active grant.
-// It is a no-op if the workflow is not PAM-gated and no explicit entitlement is provided.
-func EnsurePAMGrant(ctx context.Context, project, pamEntitlement, reason string, workflowLabels map[string]string, stdin io.Reader, stderr io.Writer) error {
-	if workflowLabels["pam_gated"] != "true" {
+// It is a no-op if pamGated is false and no explicit entitlement is provided.
+func EnsurePAMGrant(ctx context.Context, project, pamEntitlement, reason string, pamGated bool, stdin io.Reader, stderr io.Writer) error {
+	if !pamGated && pamEntitlement == "" {
 		return nil
 	}
 

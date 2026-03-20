@@ -1,0 +1,126 @@
+# Remote tool configuration for the SRE companion agent.
+#
+# These tools are executed server-side via Cloud Workflows.
+# Client-side tools (pam_request, wf_run_*) are dynamically
+# provided by the CLI in each request.
+
+tools:
+  get_resources:
+    description: >-
+      List or get Kubernetes resources from the cluster. Use this to discover
+      what resources exist, check pod statuses, find unhealthy deployments,
+      list events, or inspect any Kubernetes resource type.
+    workflow: get
+    parameters:
+      type: object
+      required:
+        - resource_type
+      properties:
+        resource_type:
+          type: string
+          description: >-
+            The Kubernetes resource type to query. Common types: pods, deployments,
+            services, events, nodes, namespaces, statefulsets, daemonsets,
+            persistentvolumeclaims, persistentvolumes. HyperShift types:
+            hostedclusters, nodepools, hostedcontrolplanes.
+          enum:
+            - pods
+            - deployments
+            - services
+            - events
+            - nodes
+            - namespaces
+            - statefulsets
+            - daemonsets
+            - persistentvolumeclaims
+            - persistentvolumes
+            - hostedclusters
+            - nodepools
+            - hostedcontrolplanes
+            - configmaps
+        namespace:
+          type: string
+          description: >-
+            Kubernetes namespace to query. Required for namespaced resources.
+        name:
+          type: string
+          description: >-
+            Specific resource name to get. Omit to list all resources of this
+            type in the namespace.
+        label_selector:
+          type: string
+          description: >-
+            Label selector to filter resources (e.g., "app=nginx").
+
+  describe_resource:
+    description: >-
+      Get detailed information about a specific Kubernetes resource including
+      its full spec, status, conditions, and related events.
+    workflow: describe
+    parameters:
+      type: object
+      required:
+        - resource_type
+        - name
+      properties:
+        resource_type:
+          type: string
+          description: >-
+            The Kubernetes resource type to describe.
+          enum:
+            - pods
+            - deployments
+            - services
+            - nodes
+            - namespaces
+            - statefulsets
+            - daemonsets
+            - persistentvolumeclaims
+            - persistentvolumes
+            - configmaps
+            - hostedclusters
+            - nodepools
+            - hostedcontrolplanes
+        namespace:
+          type: string
+          description: >-
+            Kubernetes namespace of the resource.
+        name:
+          type: string
+          description: The exact name of the resource to describe.
+
+  get_logs:
+    description: >-
+      Retrieve container logs from a specific pod. Use this to examine
+      application output, error messages, and stack traces.
+    workflow: logs
+    parameters:
+      type: object
+      required:
+        - namespace
+        - pod
+      properties:
+        namespace:
+          type: string
+          description: Kubernetes namespace where the pod is running.
+        pod:
+          type: string
+          description: The name of the pod to get logs from.
+        container:
+          type: string
+          description: >-
+            Specific container name within the pod. If omitted, logs from the
+            first container are returned.
+        tail_lines:
+          type: integer
+          description: >-
+            Number of log lines to retrieve from the end. Defaults to 100.
+        previous:
+          type: boolean
+          description: >-
+            If true, get logs from the previous container instance. Essential
+            for diagnosing CrashLoopBackOff.
+        since_seconds:
+          type: integer
+          description: >-
+            Return logs newer than this many seconds.

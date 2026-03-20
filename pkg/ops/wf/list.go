@@ -87,10 +87,14 @@ func listWorkflows(ctx context.Context, client *workflows.Client, outputFormat s
 		return nil
 	}
 
-	t := output.NewTable(os.Stdout, "NAME", "STATE", "REVISION", "UPDATED")
+	t := output.NewTable(os.Stdout, "NAME", "STATE", "PAM_GATED", "REVISION", "UPDATED")
 	for _, wf := range wfs {
 		updated := wf.UpdateTime.Format(time.RFC3339)
-		t.AddRow(wf.Name, wf.State, wf.RevisionID, updated)
+		pamGated := ""
+		if wf.PamGated {
+			pamGated = "yes"
+		}
+		t.AddRow(wf.Name, wf.State, pamGated, wf.RevisionID, updated)
 	}
 	return t.Flush()
 }

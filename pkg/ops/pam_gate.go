@@ -14,17 +14,9 @@ import (
 func checkPAMGate(ctx context.Context, wfClient *workflows.Client, workflowName string, cmd *cobra.Command, stderr io.Writer) error {
 	pamEntitlement, _ := cmd.Flags().GetString("pam-entitlement")
 
-	var labels map[string]string
-	if wfDetail, err := wfClient.GetWorkflow(ctx, workflowName); err == nil {
-		labels = wfDetail.Labels
-	} else if pamEntitlement != "" {
-		labels = map[string]string{}
-	} else {
-		// Can't get workflow metadata and no explicit entitlement; skip PAM check
-		return nil
-	}
+	pamGated := workflows.CheckPamGatedTag(ctx, wfClient.Project, wfClient.Region, workflowName)
 
 	reason, _ := cmd.Flags().GetString("reason")
 
-	return pam.EnsurePAMGrant(ctx, wfClient.Project, pamEntitlement, reason, labels, os.Stdin, stderr)
+	return pam.EnsurePAMGrant(ctx, wfClient.Project, pamEntitlement, reason, pamGated, os.Stdin, stderr)
 }

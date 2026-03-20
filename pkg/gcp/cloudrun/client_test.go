@@ -385,6 +385,160 @@ func TestDiagnose_NoRetryOnNonTransient(t *testing.T) {
 	}
 }
 
+func TestChatStream_TextAndDone(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat" {
+			t.Errorf("expected path /chat, got %s", r.URL.Path)
+		}
+
+		var req ChatRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		if len(req.History) != 1 || req.History[0].Content != "hello" {
+			t.Errorf("unexpected history: %+v", req.History)
+		}
+
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprintln(w, `{"event":"text","content":"Hi there!"}`)
+		fmt.Fprintln(w, `{"event":"done"}`)
+	}))
+	defer server.Close()
+
+	client := &Client{
+		Project:    "test-project",
+		Region:     "us-central1",
+		httpClient: server.Client(),
+	}
+
+	var events []StreamEvent
+	result, err := client.ChatStream(t.Context(), server.URL, ChatRequest{
+		History: []ChatMessage{{Role: "user", Content: "hello"}},
+	}, func(event StreamEvent) {
+		events = append(events, event)
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(events))
+	}
+	if events[0].Event != "text" || events[0].Content != "Hi there!" {
+		t.Errorf("unexpected first event: %+v", events[0])
+	}
+	if events[1].Event != "done" {
+		t.Errorf("unexpected second event: %+v", events[1])
+	}
+	if result.PendingToolCall != nil {
+		t.Error("expected no pending tool call")
+	}
+}
+
+func TestChatStream_ToolCall(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprintln(w, `{"event":"text","content":"Let me delete that pod."}`)
+		fmt.Fprintln(w, `{"event":"tool_call","call_id":"tc-1","tool":"wf_run_delete_pod","parameters":{"namespace":"default","pod":"test-pod"}}`)
+	}))
+	defer server.Close()
+
+	client := &Client{
+		Project:    "test-project",
+		Region:     "us-central1",
+		httpClient: server.Client(),
+	}
+
+	var events []StreamEvent
+	result, err := client.ChatStream(t.Context(), server.URL, ChatRequest{
+		History: []ChatMessage{{Role: "user", Content: "delete pod test-pod"}},
+	}, func(event StreamEvent) {
+		events = append(events, event)
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(events))
+	}
+	if result.PendingToolCall == nil {
+		t.Fatal("expected pending tool call")
+	}
+	if result.PendingToolCall.Tool != "wf_run_delete_pod" {
+		t.Errorf("unexpected tool: %s", result.PendingToolCall.Tool)
+	}
+	if result.PendingToolCall.CallID != "tc-1" {
+		t.Errorf("unexpected call_id: %s", result.PendingToolCall.CallID)
+	}
+}
+
+func TestChatStream_ToolResult(t *testing.T) {
+	// Test that tool_result in request is properly sent
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req ChatRequest
+		json.NewDecoder(r.Body).Decode(&req)
+
+		if req.ToolResult == nil {
+			t.Fatal("expected tool_result in request")
+		}
+		if req.ToolResult.CallID != "tc-1" {
+			t.Errorf("unexpected call_id: %s", req.ToolResult.CallID)
+		}
+		if req.ToolResult.Tool != "wf_run_delete_pod" {
+			t.Errorf("unexpected tool: %s", req.ToolResult.Tool)
+		}
+
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprintln(w, `{"event":"text","content":"Pod deleted successfully."}`)
+		fmt.Fprintln(w, `{"event":"done"}`)
+	}))
+	defer server.Close()
+
+	client := &Client{
+		Project:    "test-project",
+		Region:     "us-central1",
+		httpClient: server.Client(),
+	}
+
+	result, err := client.ChatStream(t.Context(), server.URL, ChatRequest{
+		History: []ChatMessage{{Role: "user", Content: "delete pod"}},
+		ToolResult: &ChatToolResult{
+			CallID: "tc-1",
+			Tool:   "wf_run_delete_pod",
+			Result: json.RawMessage(`{"state":"SUCCEEDED"}`),
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.PendingToolCall != nil {
+		t.Error("expected no pending tool call")
+	}
+}
+
+func TestChatStream_Error(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprintln(w, `{"event":"error","error":"model overloaded"}`)
+	}))
+	defer server.Close()
+
+	client := &Client{
+		Project:    "test-project",
+		Region:     "us-central1",
+		httpClient: server.Client(),
+	}
+
+	_, err := client.ChatStream(t.Context(), server.URL, ChatRequest{
+		History: []ChatMessage{{Role: "user", Content: "test"}},
+	}, nil)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !contains(err.Error(), "model overloaded") {
+		t.Errorf("expected error to contain 'model overloaded', got %q", err.Error())
+	}
+}
+
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && searchString(s, substr)
 }

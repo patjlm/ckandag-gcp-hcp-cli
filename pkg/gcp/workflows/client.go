@@ -5,13 +5,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	executions "cloud.google.com/go/workflows/executions/apiv1"
 	executionspb "cloud.google.com/go/workflows/executions/apiv1/executionspb"
 	wfapi "cloud.google.com/go/workflows/apiv1"
 	workflowspb "cloud.google.com/go/workflows/apiv1/workflowspb"
+	"golang.org/x/oauth2/google"
 	"google.golang.org/api/iterator"
 )
 
@@ -103,10 +108,12 @@ type ExecutionResult struct {
 
 // WorkflowInfo holds metadata about a workflow.
 type WorkflowInfo struct {
-	Name       string    `json:"name"`
-	State      string    `json:"state"`
-	RevisionID string    `json:"revision_id"`
-	UpdateTime time.Time `json:"update_time"`
+	Name       string            `json:"name"`
+	State      string            `json:"state"`
+	RevisionID string            `json:"revision_id"`
+	UpdateTime time.Time         `json:"update_time"`
+	Labels     map[string]string `json:"labels,omitempty"`
+	PamGated   bool              `json:"pam_gated"`
 }
 
 // ExecutionInfo holds metadata about a workflow execution.
@@ -128,12 +135,13 @@ func (c *Client) workflowName(name string) string {
 
 // WorkflowDetail holds detailed metadata about a workflow, including labels.
 type WorkflowDetail struct {
-	Name   string            `json:"name"`
-	State  string            `json:"state"`
-	Labels map[string]string `json:"labels,omitempty"`
+	Name           string            `json:"name"`
+	State          string            `json:"state"`
+	Labels         map[string]string `json:"labels,omitempty"`
+	SourceContents string            `json:"source_contents,omitempty"`
 }
 
-// GetWorkflow retrieves metadata for a workflow, including labels.
+// GetWorkflow retrieves metadata for a workflow, including labels and source.
 func (c *Client) GetWorkflow(ctx context.Context, name string) (*WorkflowDetail, error) {
 	wf, err := c.workflowClient.GetWorkflow(ctx, &workflowspb.GetWorkflowRequest{
 		Name: c.workflowName(name),
@@ -142,10 +150,70 @@ func (c *Client) GetWorkflow(ctx context.Context, name string) (*WorkflowDetail,
 		return nil, wrapAuthError("getting workflow '"+name+"'", err)
 	}
 	return &WorkflowDetail{
-		Name:   name,
-		State:  wf.State.String(),
-		Labels: wf.Labels,
+		Name:           name,
+		State:          wf.State.String(),
+		Labels:         wf.Labels,
+		SourceContents: wf.GetSourceContents(),
 	}, nil
+}
+
+// WorkflowParam describes a parameter parsed from a workflow's source header.
+type WorkflowParam struct {
+	Name        string `json:"name"`
+	Required    bool   `json:"required"`
+	Description string `json:"description"`
+}
+
+// ParseParams extracts parameter definitions from the workflow source comments.
+// It looks for lines matching: #   - param_name (required|optional): description
+func ParseParams(source string) []WorkflowParam {
+	var params []WorkflowParam
+	inParams := false
+
+	for _, line := range strings.Split(source, "\n") {
+		trimmed := strings.TrimSpace(line)
+
+		if trimmed == "# Parameters:" {
+			inParams = true
+			continue
+		}
+
+		if inParams {
+			// End of parameters section: non-comment or non-parameter line
+			if !strings.HasPrefix(trimmed, "#") {
+				break
+			}
+			content := strings.TrimPrefix(trimmed, "#")
+			content = strings.TrimSpace(content)
+			if !strings.HasPrefix(content, "- ") {
+				break
+			}
+			content = strings.TrimPrefix(content, "- ")
+
+			// Parse: param_name (required|optional): description
+			parts := strings.SplitN(content, ":", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			nameAndReq := strings.TrimSpace(parts[0])
+			desc := strings.TrimSpace(parts[1])
+
+			required := false
+			name := nameAndReq
+			if idx := strings.Index(nameAndReq, " ("); idx > 0 {
+				name = nameAndReq[:idx]
+				qualifier := nameAndReq[idx:]
+				required = strings.Contains(qualifier, "required")
+			}
+
+			params = append(params, WorkflowParam{
+				Name:        name,
+				Required:    required,
+				Description: desc,
+			})
+		}
+	}
+	return params
 }
 
 // Execute starts a workflow and returns the execution name.
@@ -319,13 +387,17 @@ func (c *Client) ListExecutions(ctx context.Context, workflow string, limit int)
 	return result, nil
 }
 
-// List returns all workflows in the project/region.
+// List returns all workflows in the project/region, including PAM-gated status
+// detected via GCP Resource Tags.
 func (c *Client) List(ctx context.Context) ([]WorkflowInfo, error) {
 	var result []WorkflowInfo
 
 	it := c.workflowClient.ListWorkflows(ctx, &workflowspb.ListWorkflowsRequest{
 		Parent: c.workflowParent(),
 	})
+
+	// fullNames tracks the full resource name for each workflow index
+	var fullNames []string
 
 	for {
 		wf, err := it.Next()
@@ -345,12 +417,103 @@ func (c *Client) List(ctx context.Context) ([]WorkflowInfo, error) {
 			Name:       shortName,
 			State:      wf.State.String(),
 			RevisionID: wf.RevisionId,
+			Labels:     wf.Labels,
 		}
 		if wf.UpdateTime != nil {
 			info.UpdateTime = wf.UpdateTime.AsTime()
 		}
 		result = append(result, info)
+		fullNames = append(fullNames, wf.Name)
+	}
+
+	// Resolve PAM-gated status from GCP Resource Tags (best-effort)
+	pamGated := c.fetchPamGatedFlags(ctx, fullNames)
+	for i := range result {
+		result[i].PamGated = pamGated[i]
 	}
 
 	return result, nil
+}
+
+// fetchPamGatedFlags concurrently checks tag bindings for each workflow
+// to determine if it has the pam-gated=true tag.
+func (c *Client) fetchPamGatedFlags(ctx context.Context, fullNames []string) []bool {
+	flags := make([]bool, len(fullNames))
+	if len(fullNames) == 0 {
+		return flags
+	}
+
+	httpClient, err := google.DefaultClient(ctx, "https://www.googleapis.com/auth/cloud-platform")
+	if err != nil {
+		return flags // best-effort
+	}
+
+	var wg sync.WaitGroup
+	for i, name := range fullNames {
+		wg.Add(1)
+		go func(idx int, wfName string) {
+			defer wg.Done()
+			flags[idx] = checkPamGatedTag(ctx, httpClient, c.Region, wfName)
+		}(i, name)
+	}
+	wg.Wait()
+
+	return flags
+}
+
+// tagBindingsResponse is the JSON response from the tag bindings API.
+type tagBindingsResponse struct {
+	TagBindings []struct {
+		TagValueNamespacedName string `json:"tagValueNamespacedName"`
+	} `json:"tagBindings"`
+}
+
+// CheckPamGatedTag checks if a workflow has the pam-gated=true resource tag.
+// It uses the workflow short name and constructs the full resource path internally.
+func CheckPamGatedTag(ctx context.Context, project, region, workflowName string) bool {
+	httpClient, err := google.DefaultClient(ctx, "https://www.googleapis.com/auth/cloud-platform")
+	if err != nil {
+		return false
+	}
+	fullName := fmt.Sprintf("projects/%s/locations/%s/workflows/%s", project, region, workflowName)
+	return checkPamGatedTag(ctx, httpClient, region, fullName)
+}
+
+// checkPamGatedTag queries the Resource Manager tag bindings API for a workflow
+// and returns true if it has a pam-gated/true tag.
+func checkPamGatedTag(ctx context.Context, httpClient *http.Client, region, workflowFullName string) bool {
+	parent := url.QueryEscape("//workflows.googleapis.com/" + workflowFullName)
+	apiURL := fmt.Sprintf("https://%s-cloudresourcemanager.googleapis.com/v3/tagBindings?parent=%s", region, parent)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		return false
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false
+	}
+
+	var result tagBindingsResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		return false
+	}
+
+	for _, tb := range result.TagBindings {
+		if strings.HasSuffix(tb.TagValueNamespacedName, "/pam-gated/true") {
+			return true
+		}
+	}
+	return false
 }

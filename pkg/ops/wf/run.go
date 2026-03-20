@@ -74,17 +74,10 @@ Examples:
 
 			// Check PAM gate
 			pamEntitlement, _ := cmd.Flags().GetString("pam-entitlement")
-			var labels map[string]string
-			if wfDetail, err := client.GetWorkflow(ctx, workflowName); err == nil {
-				labels = wfDetail.Labels
-			} else if pamEntitlement != "" {
-				labels = map[string]string{}
-			}
-			if labels != nil {
-				reason, _ := cmd.Flags().GetString("reason")
-				if err := pam.EnsurePAMGrant(ctx, project, pamEntitlement, reason, labels, os.Stdin, os.Stderr); err != nil {
-					return err
-				}
+			pamGated := workflows.CheckPamGatedTag(ctx, project, region, workflowName)
+			reason, _ := cmd.Flags().GetString("reason")
+			if err := pam.EnsurePAMGrant(ctx, project, pamEntitlement, reason, pamGated, os.Stdin, os.Stderr); err != nil {
+				return err
 			}
 
 			fmt.Fprintf(os.Stderr, "Executing workflow: %s\n", workflowName)

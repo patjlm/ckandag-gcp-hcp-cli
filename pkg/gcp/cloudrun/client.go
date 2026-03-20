@@ -51,10 +51,12 @@ type DiagnoseRequest struct {
 
 // StreamEvent represents a single NDJSON event from the streaming response.
 type StreamEvent struct {
-	Event      string                 `json:"event"`                // "tool_call", "tool_result", "done", "error"
+	Event      string                 `json:"event"`                // "tool_call", "tool_result", "done", "error", "text"
 	Tool       string                 `json:"tool,omitempty"`       // tool name (for tool_call/tool_result)
+	CallID     string                 `json:"call_id,omitempty"`    // unique ID for tool_call correlation
 	Parameters map[string]interface{} `json:"parameters,omitempty"` // tool parameters (for tool_call)
 	Result     json.RawMessage        `json:"result,omitempty"`     // tool result or final result (for tool_result/done)
+	Content    string                 `json:"content,omitempty"`    // text content (for text event)
 	Error      string                 `json:"error,omitempty"`      // error message (for error event)
 }
 
@@ -323,6 +325,108 @@ func (t *identityTokenTransport) RoundTrip(req *http.Request) (*http.Response, e
 	req = req.Clone(req.Context())
 	req.Header.Set("Authorization", "Bearer "+t.token)
 	return t.base.RoundTrip(req)
+}
+
+// ToolDef describes a tool that the CLI can execute locally.
+type ToolDef struct {
+	Name        string                 `json:"name"`
+	Description string                 `json:"description"`
+	Parameters  map[string]interface{} `json:"parameters"`
+}
+
+// ChatMessage represents a single message in the conversation history.
+type ChatMessage struct {
+	Role    string `json:"role"`    // "user" or "assistant"
+	Content string `json:"content"`
+}
+
+// ChatToolResult carries the result of a locally-executed tool call.
+type ChatToolResult struct {
+	CallID     string                 `json:"call_id"`
+	Tool       string                 `json:"tool"`
+	Parameters map[string]interface{} `json:"parameters,omitempty"`
+	Result     json.RawMessage        `json:"result"`
+	Error      string                 `json:"error,omitempty"`
+}
+
+// ChatRequest is the payload for each conversational turn.
+type ChatRequest struct {
+	History       []ChatMessage   `json:"history"`
+	Tools         []ToolDef       `json:"tools"`
+	ToolResult    *ChatToolResult `json:"tool_result,omitempty"`
+	MaxIterations int             `json:"max_iterations,omitempty"`
+}
+
+// ChatTurnResult is returned by ChatStream after consuming the NDJSON stream.
+type ChatTurnResult struct {
+	PendingToolCall *StreamEvent // non-nil if stream ended with a tool_call event
+}
+
+// ChatStream sends a chat request and streams NDJSON events via onEvent.
+// If the stream ends with a tool_call event, ChatTurnResult.PendingToolCall is set.
+func (c *Client) ChatStream(ctx context.Context, serviceURL string, req ChatRequest, onEvent func(StreamEvent)) (*ChatTurnResult, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling request: %w", err)
+	}
+
+	endpoint := strings.TrimRight(serviceURL, "/") + "/chat"
+
+	httpClient, err := c.getHTTPClient(ctx, serviceURL)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.doWithRetry(ctx, httpClient, http.MethodPost, endpoint,
+		func() io.Reader { return bytes.NewReader(body) },
+		map[string]string{"Content-Type": "application/json"},
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("sre-companion-agent returned %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	result := &ChatTurnResult{}
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		var event StreamEvent
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			continue
+		}
+
+		if onEvent != nil {
+			onEvent(event)
+		}
+
+		switch event.Event {
+		case "done":
+			return result, nil
+		case "error":
+			return nil, fmt.Errorf("sre-companion-agent error: %s", event.Error)
+		case "tool_call":
+			result.PendingToolCall = &event
+			return result, nil
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("reading stream: %w", err)
+	}
+
+	return nil, fmt.Errorf("stream ended without a done or tool_call event")
 }
 
 // ParseResponse parses a raw JSON byte slice into a DiagnoseResponse.
