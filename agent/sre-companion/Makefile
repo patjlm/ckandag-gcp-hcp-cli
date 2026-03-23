@@ -1,15 +1,16 @@
 IMAGE ?= quay.io/patmarti/sre-companion-agent:latest
 PROJECT_ID ?= $(shell gcloud config get-value project 2>/dev/null)
 REGION ?= us-central1
-AR_IMAGE ?= $(REGION)-docker.pkg.dev/$(PROJECT_ID)/quay-io/patmarti/sre-companion-agent:latest
+AR_IMAGE ?= $(REGION)-docker.pkg.dev/$(PROJECT_ID)/sre-companion/sre-companion-agent:latest
 
 .PHONY: build push deploy refresh terraform-apply all
 
 build:
-	podman build -t $(IMAGE) .
+	podman build -t $(IMAGE) -t $(AR_IMAGE) .
 
 push:
 	podman push $(IMAGE)
+	podman push $(AR_IMAGE)
 
 refresh:
 	gcloud run services update sre-companion-agent \

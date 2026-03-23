@@ -69,9 +69,13 @@ def run_agent(history, client_tools, tool_result=None,
     # Convert history to Gemini Content objects, trimming if too long
     gemini_history = _convert_history(history[:-1]) if len(history) > 1 else []
     gemini_history = _trim_history(model, gemini_history, MAX_INPUT_TOKENS)
-    chat = model.start_chat(history=gemini_history)
 
-    # Determine what to send as the next message
+    # Build the initial contents list for generate_content.
+    # We use generate_content directly instead of chat.send_message to avoid
+    # the SDK's internal response.text validation which crashes on
+    # function-call-only responses (Gemini 2.5 thinking mode).
+    contents = gemini_history
+
     if tool_result is not None:
         tool_name = tool_result.get("tool", "")
         tool_params = tool_result.get("parameters", {})
@@ -85,23 +89,19 @@ def run_agent(history, client_tools, tool_result=None,
                 except (json.JSONDecodeError, TypeError):
                     func_response = {"result": func_response}
 
-        # Inject the assistant's function_call into chat history so the model
-        # knows it already called this tool and doesn't re-issue the call.
-        chat.history.append(
-            Content(role="model", parts=[Part.from_function_call(
-                name=tool_name, args=tool_params,
-            )])
-        )
-
-        next_message = Content(
-            parts=[Part.from_function_response(name=tool_name, response=func_response)]
-        )
+        # Inject the assistant's function_call so the model knows it already called this tool
+        contents.append(Content(role="model", parts=[
+            Part.from_function_call(name=tool_name, args=tool_params),
+        ]))
+        contents.append(Content(role="user", parts=[
+            Part.from_function_response(name=tool_name, response=func_response),
+        ]))
     else:
         last_message = history[-1]["content"] if history else ""
-        next_message = last_message
+        contents.append(Content(role="user", parts=[Part.from_text(last_message)]))
 
     try:
-        response = chat.send_message(next_message)
+        response = model.generate_content(contents)
     except Exception as e:
         logger.exception("Failed to send message: %s", e)
         yield {"event": "error", "error": f"Failed to communicate with AI model: {e}"}
@@ -138,6 +138,9 @@ def run_agent(history, client_tools, tool_result=None,
                 }
                 return
 
+        # Append the model's response to contents for next turn
+        contents.append(response.candidates[0].content)
+
         # All calls are remote — execute them and collect responses
         response_parts = []
         any_valid = False
@@ -172,11 +175,13 @@ def run_agent(history, client_tools, tool_result=None,
                 logger.warning("Breaking after %d consecutive stalls (no valid tools)", stall_count)
                 break
 
+        # Append function responses and get next model response
+        contents.append(Content(role="user", parts=response_parts))
         try:
-            response = chat.send_message(Content(parts=response_parts))
+            response = model.generate_content(contents)
         except Exception as e:
             logger.exception("Failed to send tool results: %s", e)
-            yield {"event": "error", "error": str(e)}
+            yield {"event": "error", "error": f"Failed to communicate with AI model: {e}"}
             return
 
     yield {
